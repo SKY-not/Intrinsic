@@ -3,17 +3,18 @@ import copy
 import json
 from pathlib import Path
 import numpy as np
+from .quality import DEFAULTS as QUALITY_DEFAULTS, LEGACY_KEYS, quality_config
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "configs/pipeline.json"
 DEFAULT_COMPARE_PATH = DEFAULT_PATH.with_name("compare.json")
 DEFAULT_DETECTOR = {"backend": "opencv", "opencv": {"corner_refinement": "SUBPIX", "window_size": 5},
-                    "pyapriltags": {"quad_decimate": 1.0, "refine_edges": 1}}
+                    "pyapriltags": {"quad_decimate": 1.0, "refine_edges": 1}, "opencv_charuco": {}}
 DEFAULT_CONFIG = {
     "board": {"family": "tag36h11", "board_size_m": .07, "tag_size_m": .02,
               "gap_m": .01, "ids": [1, 2, 3, 4], "rotations_deg": [180, 180, 180, 180]},
     "camera": {"exposure_us": None, "gain_db": None, "gain_auto": "off", "resolution": "max", "lens_note": ""},
     "capture": {"detection_hz": 5, "preview_width": 1280},
-    "quality": {"blur_variance_min": 40, "tag_edge_min_px": 30, "saturation_fraction_max": .4},
+    "quality": copy.deepcopy(QUALITY_DEFAULTS),
     "calibration": {"min_views": 15, "review_rms_px": 1.0},
     "detector": copy.deepcopy(DEFAULT_DETECTOR),
 }
@@ -34,8 +35,18 @@ def detector_settings(config, backend=None, parameters=None):
             settings[key].update(value)
     if backend is not None:
         settings["backend"] = backend
-    if settings["backend"] not in ("opencv", "pyapriltags"):
-        raise ValueError("detector.backend must be opencv or pyapriltags")
+    board = config.get("board", {})
+    if not isinstance(board, dict):
+        raise ValueError("Board configuration must be an object")
+    kind = board.get("type", "four_apriltag")
+    if settings["backend"] == "auto":
+        settings["backend"] = "opencv_charuco" if kind == "charuco" else "pyapriltags"
+    if kind == "charuco" and settings["backend"] == "opencv":
+        settings["backend"] = "opencv_charuco"
+    if settings["backend"] not in ("opencv", "pyapriltags", "opencv_charuco"):
+        raise ValueError("detector.backend must be auto, opencv, pyapriltags or opencv_charuco")
+    if (kind == "charuco") != (settings["backend"] == "opencv_charuco"):
+        raise ValueError("ChArUco requires its OpenCV detector; AprilTag requires opencv or pyapriltags")
     if parameters is not None:
         target = settings[settings["backend"]]
         if not isinstance(parameters, dict) or set(parameters) - set(target):
@@ -89,13 +100,28 @@ def load_config(path: str | Path | None = None) -> dict:
             override["board"] = json.loads((path.parent / board_file).read_text(encoding="utf-8-sig"))
         for key, value in override.items():
             if key == "detector":
-                config[key] = detector_settings({"detector": value})
+                config[key] = copy.deepcopy(value)
+                continue
+            if key == "board":
+                if not isinstance(value, dict):
+                    raise ValueError("Board configuration must be an object")
+                if value.get("type", "four_apriltag") == "four_apriltag":
+                    config[key].update(value)
+                else:
+                    config[key] = copy.deepcopy(value)
+                continue
+            if key == "quality":
+                if not isinstance(value, dict):
+                    raise ValueError("Quality configuration must be an object")
+                quality_config(value)
+                config[key] = copy.deepcopy(value) if set(value) == LEGACY_KEYS else quality_config(value)
                 continue
             if key not in config or not isinstance(value, dict):
                 raise ValueError(f"Unknown configuration section: {key}")
             if set(value) - set(config[key]):
                 raise ValueError(f"Unknown configuration keys in {key}: {set(value) - set(config[key])}")
             config[key].update(value)
+    config["detector"] = detector_settings(config)
     validate_config(config)
     return config
 
@@ -123,6 +149,13 @@ def validate_config(config: dict) -> None:
     if set(config) - set(DEFAULT_CONFIG) or set(DEFAULT_CONFIG) - set(config) - {"detector"}:
         raise ValueError("Missing/unknown configuration sections")
     for section, defaults in DEFAULT_CONFIG.items():
+        if section == "board":
+            continue  # Each board type validates its own fields below.
+        if section == "quality":
+            if not isinstance(config[section], dict):
+                raise ValueError("Quality configuration must be an object")
+            quality_config(config[section])
+            continue
         if section == "detector":
             detector_settings(config)
             continue
@@ -142,7 +175,7 @@ def validate_config(config: dict) -> None:
         raise ValueError("camera.lens_note must be a string")
     from .board import Board
     Board.from_config(config)
-    for section in ("camera", "capture", "quality", "calibration"):
+    for section in ("camera", "capture", "calibration"):
         for name, value in config[section].items():
             if section == "camera" and name in ("gain_auto", "resolution", "lens_note"):
                 continue
@@ -156,8 +189,6 @@ def validate_config(config: dict) -> None:
         raise ValueError("preview_width must be an integer >= 320")
     if config["calibration"]["min_views"] < 15 or type(config["calibration"]["min_views"]) is not int:
         raise ValueError("At least 15 calibration views are required (integer min_views)")
-    if config["quality"]["saturation_fraction_max"] > 1:
-        raise ValueError("saturation_fraction_max must be in (0, 1]")
 
 
 def resolve_camera_config(config, serial, config_path=None, profile_path=None, overrides=None):

@@ -14,17 +14,18 @@ from .config import DEFAULT_PATH, DEFAULT_COMPARE_PATH, detector_settings, load_
 from .report import export_report, compare_results, export_corner_comparison, export_detector_comparison, comparison_metadata, write_calibration, read_calibration
 from .session import Session, new_id, read_image, read_json, write_image, write_json
 from .solver import calibrate, apply_validation, residual_metrics
+from .quality import warning_text
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent / "data"
 
 
 def configured_detection(config, args):
-    backend = args.detector or detector_settings(config)["backend"]
+    backend = detector_settings(config, args.detector)["backend"]
     choices = {"opencv": {"corner_refinement": getattr(args, "corner_refinement", None),
                           "window_size": getattr(args, "corner_window_size", None)},
                "pyapriltags": {"quad_decimate": getattr(args, "quad_decimate", None),
-                               "refine_edges": getattr(args, "refine_edges", None)}}
+                               "refine_edges": getattr(args, "refine_edges", None)}, "opencv_charuco": {}}
     if any(value is not None for name, params in choices.items() if name != backend for value in params.values()):
         raise ValueError("CLI detector parameters must belong to the selected backend")
     parameters = {key: value for key, value in choices[backend].items() if value is not None}
@@ -34,7 +35,7 @@ def configured_detection(config, args):
 
 
 def detector_arguments(command):
-    command.add_argument("--detector", choices=["opencv", "pyapriltags"], default=None,
+    command.add_argument("--detector", choices=["auto", "opencv", "pyapriltags"], default=None,
                          help="覆盖 detector.backend；未指定时采用配置，旧配置默认为 opencv")
     command.add_argument("--corner-refinement", type=str.upper, choices=["NONE", "SUBPIX", "CONTOUR", "APRILTAG"])
     command.add_argument("--corner-window-size", type=int, help="OpenCV 精化窗口上限，单位 px")
@@ -70,6 +71,8 @@ def import_images(args):
             observation = detector.detect(image)
             if not observation.valid:
                 raise ValueError("; ".join(observation.issues))
+            for warning in observation.warnings:
+                print(f"{path.name} WARNING: {warning_text(warning)}")
             if session is None:
                 session = Session.create(args.output, config,
                     {"serial": args.camera_id, "source": "import", "settings": "declared same camera/lens/ROI; not independently verified"}, image.shape[1::-1])
@@ -81,7 +84,7 @@ def import_images(args):
             rejected.append({"source": str(path), "reason": str(error)})
             print(f"跳过 {path.name}: {error}")
     if session is None:
-        raise ValueError("No valid four-tag images found")
+        raise ValueError("No valid calibration-board images found")
     write_json(session.path / f"import_{new_id()}.json", {"accepted": accepted, "rejected": rejected})
     print(f"导入 {len(accepted)} 张，跳过 {len(rejected)} 张。会话：{session.path}")
     if not accepted:
@@ -91,6 +94,8 @@ def import_images(args):
 def compare_detectors(args):
     """Compare configured schemes through shared Detector, Session and solver."""
     sources = [Session(path) for path in args.session]
+    if any(Board.from_config(source.config).kind != "four_apriltag" for source in sources):
+        raise ValueError("compare-detectors currently supports four-AprilTag sessions only")
     if len({source.path for source in sources}) != len(sources):
         raise ValueError("Duplicate input session")
     fixed = getattr(args, "frame_ids", None)
@@ -186,7 +191,7 @@ def compare_detectors(args):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="海康 USB / GigE 相机 AprilTag 内参标定")
+    p = argparse.ArgumentParser(description="海康 USB / GigE 相机 AprilTag / ChArUco 内参标定")
     commands = p.add_subparsers(dest="command", required=True)
     commands.add_parser("devices", help="列出海康 USB / GigE 网口相机及网络地址")
     cap = commands.add_parser("capture", help="实时预览、标定/验证图采集")
@@ -275,8 +280,15 @@ def main(argv=None) -> int:
             if path.exists():
                 raise ValueError("Output already exists; choose a new filename")
             path.parent.mkdir(parents=True, exist_ok=True)
-            write_image(path, Board.from_config(load_config(args.config)).render())
-            print(f"参考图：{path}；默认整板应打印为 70 mm，标签黑边宽 20 mm；必须实测。")
+            config = load_config(args.config)
+            board = Board.from_config(config)
+            write_image(path, board.render())
+            if board.kind == "charuco":
+                b = config["board"]
+                width, height = [n * b["square_length_m"] * 1000 for n in b["squares"]]
+                print(f"参考图：{path}；ChArUco 棋盘区域 {width:g} x {height:g} mm，格长 {b['square_length_m']*1000:g} mm；打印后必须实测。")
+            else:
+                print(f"参考图：{path}；整板应打印为 {board.size*1000:g} mm，标签黑边宽 {board.tag_size*1000:g} mm；必须实测。")
         elif args.command in ("calibrate", "validate"):
             session = Session(args.session)
             if args.command == "calibrate":

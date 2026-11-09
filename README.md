@@ -1,6 +1,6 @@
 # 海康相机内参标定
 
-采集海康 USB / GigE 相机图像，使用四标签 AprilTag 板标定内参，并输出独立验证结果及离线 HTML 误差报告。
+采集海康 USB / GigE 相机图像，使用四标签 AprilTag 或 ChArUco 板标定内参，并输出独立验证结果及离线 HTML 误差报告。
 
 ## Part 1：快速开始
 
@@ -31,11 +31,23 @@ python -m intrinsic capture --serial DB2632441
 
 | 按键 | 操作 |
 |---|---|
-| Space | 保存标定图，建议 30 张，至少 15 张 |
-| V | 保存独立验证图，建议 5～10 张 |
-| Q / Esc | 退出采集 |
+| Space | 冻结标定候选图，建议保留 30 张，至少 15 张 |
+| V | 冻结独立验证候选图，建议保留 5～10 张 |
+| Enter | 保留当前候选图，写入正式会话 |
+| Delete | 排除当前候选图，原图及记录保存到 `exclude/` |
+| Q / Esc | 退出；未确认的候选图保存到 `exclude/` |
 
-固定镜头对焦和光圈，覆盖画面中央、边缘及不同倾斜角度，每次停稳后保存。每张图需要完整识别四个标签。
+固定镜头对焦和光圈，覆盖画面中央、边缘及不同倾斜角度，每次停稳后提交候选。复核时图像冻结，不能提交另一张；Enter/Delete 处理的就是当前冻结帧。四标签 AprilTag 要求四个指定标签全部可见；ChArUco 允许部分可见，每张图至少有 6 个有效、不共线的棋盘角点。
+
+切换板子只修改 `configs/pipeline.json` 的 `board_file`，路径相对于该 pipeline 文件：
+
+```json
+"board_file": "boards/charuco.json"
+```
+
+切回四标签板时改为 `boards/apriltag_20mm.json`。`detector.backend` 保持 `auto`，自动选择 pyapriltags 或 OpenCV CharucoDetector；无需切换运行命令。更换板子后开始新会话，已有会话继续使用其保存的板模型及检测器配置。
+
+候选图在保存前逐标签检查尺寸与清晰度，方法与 MultiCamCalib 一致：最短边默认不少于 30 px，标签多边形内部去除边界后的 Laplacian 方差默认不少于 80。ChArUco 检查其中的 ArUco 标记区域。warning 会打印实测值、阈值及标签 ID，并随观测保存；它只提示，不阻止保留。缺标签、角点不足、共线、越界等无效观测不能提交复核。新采集不再触发整板饱和比例和相似视角 warning。
 采集启动后会打印会话目录；将下方路径替换为实际会话目录后运行：
 
 ```powershell
@@ -49,7 +61,7 @@ python -m intrinsic calibrate --session "data/DB2632441/20261102T082210Z_121c2e9
 | `--validation off` | 关闭独立验证 |
 | `--exclude FRAME_ID ...` | 排除指定标定图，不删除原图 |
 
-当前 `pipeline.json` 默认选择 pyapriltags；保留 OpenCV 后端。配置优先级为：显式 CLI 参数 > pipeline 检测配置 > 旧配置默认 OpenCV。未传 CLI 参数时不覆盖配置。
+当前 `pipeline.json` 使用 `auto`；四标签 AprilTag 保留 OpenCV 和 pyapriltags 两种后端。配置优先级为：显式 CLI 参数 > pipeline 检测配置 > 旧配置默认 OpenCV。未传 CLI 参数时不覆盖配置。
 
 ```powershell
 python -m intrinsic capture --serial DB2632441 --detector opencv --corner-refinement CONTOUR --corner-window-size 5
@@ -61,19 +73,20 @@ python -m intrinsic compare-detectors --session "data/DB2632441/20261102T111838Z
 
 ```json
 "detector": {
-  "backend": "pyapriltags",
+  "backend": "auto",
   "opencv": {"corner_refinement": "SUBPIX", "window_size": 5},
   "pyapriltags": {"quad_decimate": 1.0, "refine_edges": 1}
 }
 ```
 
-OpenCV 方法支持 `NONE`、`SUBPIX`、`CONTOUR`、`APRILTAG`，均属于同一后端。pyapriltags 的参数可用 `--quad-decimate`、`--refine-edges 0/1` 覆盖；CLI 检测参数必须属于选中的后端。标签家族统一来自标定板配置。
+四标签板的 OpenCV 方法支持 `NONE`、`SUBPIX`、`CONTOUR`、`APRILTAG`，均属于同一后端。pyapriltags 的参数可用 `--quad-decimate`、`--refine-edges 0/1` 覆盖；CLI 检测参数必须属于选中的后端。ChArUco 使用独立的 OpenCV CharucoDetector 默认参数，不接受这些 AprilTag 检测参数。实际检测器和版本记录在会话中。
 
-多算法方案由 [configs/compare.json](configs/compare.json) 单独维护，每项包含 `name`、`backend`、`parameters`；未传 `--schemes` 时读取该文件。源会话只通过 CLI 指定。默认使用各方案共同成功的帧；单会话可用 `--frame-ids` 指定完整固定集合，固定集合中检测失败的方案不会缩小集合标定。
+四标签 AprilTag 的多算法方案由 [configs/compare.json](configs/compare.json) 单独维护，每项包含 `name`、`backend`、`parameters`；未传 `--schemes` 时读取该文件。`compare-detectors` 仅支持四标签会话，ChArUco 正常标定不依赖此文件。源会话只通过 CLI 指定。默认使用各方案共同成功的帧；单会话可用 `--frame-ids` 指定完整固定集合，固定集合中检测失败的方案不会缩小集合标定。
 
 必要单元测试使用合成数据和模拟求解器；真实数据比较必须显式指定会话，不随普通单元测试执行：
 
 ```powershell
+python -B -m unittest discover -s tests
 python -B tests/test_detector_comparison.py
 python -B tests/test_detector_comparison.py --session "data/DB2632441/20261102T111838Z_15994aa3" --schemes configs/compare.json
 ```
@@ -83,8 +96,9 @@ python -B tests/test_detector_comparison.py --session "data/DB2632441/20261102T1
 ### Input
 
 - 相机输入：通过 MVS 接入的海康 USB / GigE 相机。默认采集全幅最大分辨率，退出时恢复临时设置；网口相机自动探测传输包大小，失败时尝试 1500 字节。
-- 标定板：`tag36h11`，左上、右上、左下、右下 ID 为 1、2、3、4；黑框外边长 20 mm、净间距 10 mm，整板 70 mm。朝向见 [参考图](docs/calib_board_examples/apriltag_20mm.png)，打印后需实测尺寸。
-- 配置：默认读取 [configs/pipeline.json](configs/pipeline.json)，标定板配置在 [configs/boards/apriltag_20mm.json](configs/boards/apriltag_20mm.json)，相机配置按序列号读取 `configs/cameras/<序列号>.json`。命令行参数优先于相机配置；最终配置保存到会话。
+- 四标签板：`tag36h11`，左上、右上、左下、右下 ID 为 1、2、3、4；黑框外边长 20 mm、净间距 10 mm，整板 70 mm。朝向见 [参考图](docs/calib_board_examples/apriltag_20mm.png)，打印后需实测尺寸。
+- ChArUco 板：[configs/boards/charuco.json](configs/boards/charuco.json)，`DICT_5X5_100`，横向 12、纵向 9 格，格长 30 mm，标记边长 22.5 mm；棋盘区域 360 × 270 mm、不含外围留白，最多 88 个内部棋盘角点。使用 OpenCV 非 legacy 图案，与 MultiCamCalib 配置一致，打印后需实测尺寸。
+- 配置：默认读取 [configs/pipeline.json](configs/pipeline.json)，`board_file` 指向板配置，相机配置按序列号读取 `configs/cameras/<序列号>.json`。命令行参数优先于相机配置；最终配置保存到会话。
 - 离线输入：支持 8 位 PNG、JPEG、BMP、TIFF 图像，必须来自同一相机、镜头和成像设置。标定图与验证图通过用途字段区分。
 
 ```powershell
@@ -105,6 +119,7 @@ python -m intrinsic import-images --images "D:/images" --camera-id DB2632441
 | `session.json` | 相机身份、成像设置、分辨率及一份运行配置；实际检测参数集中保存 |
 | `images/<帧ID>.png` | 无损原始几何图像；彩色数据在 OpenCV 中按 BGR 通道处理 |
 | `frames/<帧ID>.json` | 角点、图像质量指标、标定/验证用途和帧元数据 |
+| `exclude/<候选ID>/image.png` 与 `frame.json` | 排除或退出未确认的候选图、观测、warning 和排除原因；不参与求解 |
 | `results/calib_YYYYMMDDHHmm/` | 每次标定的独立结果目录，使用北京时间；重名时追加序号 |
 | `report.html` 与 `previews/` | 离线误差报告及叠加预览；分享时一起复制 |
 | `calibration.json` | 标定参数、诊断、逐图位姿和独立验证结果；通过源会话读取运行配置 |
@@ -116,6 +131,9 @@ HTML 报告由顶部概览和四部分组成：标定质量分析、异常图像
 角点覆盖与残差 SVG 并排显示，图像按 RMSE 降序排列；逐图表格和详细参数默认折叠。没有独立验证时明确显示“未验证”。
 
 新数据不生成或校验内容哈希；旧会话中的哈希字段可兼容读取但会被忽略。Frame ID、Session ID 和标定/验证用途保持原规则；仍检查格式、尺寸及可读性。不再按像素去重，导入时需自行避免同图同时用于标定和验证。新帧用 `detector_index` 引用会话 `detectors` 中的实际检测参数，不逐帧复制配置。
+
+观测中的 `ids` 对四标签板表示标签 ID，每个对应连续四个角点；对 ChArUco 表示棋盘角点 ID，与 `corners` 一一对应，每帧可包含不同子集。结果中的 `point_ids` 和 `residuals.csv` 的 `corner` 保留实际角点编号。ChArUco 三维点直接取 OpenCV 板模型、单位为 m。逐图误差按该图有效角点计算，整体 RMSE 按所有有效角点汇总。
+历史会话的配置、质量指标和 warning 原样读取；不将旧整板模糊方差解释为新逐标签清晰度。离线导入在写入前检查并打印 warning，使用既有导入命令直接保存，不进入交互复核。
 
 K 中焦距和主点的单位为 px，D 为无量纲，顺序是 `[k1,k2,p1,p2,k3]`。
 角点位于原始图像像素坐标系，原点在左上角，u 向右、v 向下；残差为观测点减投影点。
@@ -161,15 +179,16 @@ Compare 仅在内存中构造只读会话，原图从源会话读取。不输出
 
 ## Part 3：算法流程
 
-1. 使用 MVS 取流并转换为 Mono8 / BGR8，保留原始像素几何；按配置调用 OpenCV 或 pyapriltags，固定坐标适配后执行共同质量检查，输出兼容的 Observation。
-2. 将图像、角点及相机设置保存为采集会话，区分标定图和独立验证图。
-3. 使用标定板三维坐标与图像角点，调用 OpenCV 求解针孔模型和 Brown 五参数畸变，计算重投影残差及已有诊断。
+1. 使用 MVS 取流并转换为 Mono8 / BGR8，保留原始像素几何；按板类型调用 AprilTag 检测器或 OpenCV CharucoDetector。
+2. 冻结候选图，检测并逐标签检查质量；Enter 保留，Delete 排除，区分标定图和独立验证图。
+3. 按每帧角点 ID 匹配标定板三维坐标与图像角点，调用 OpenCV 求解针孔模型和 Brown 五参数畸变，计算重投影残差及已有诊断。
 4. 独立验证固定 K、D，仅估计每张验证图的标定板位姿，不将验证图用于内参求解。
 5. 导出 JSON、CSV 和预览图；展示模块根据已有统计生成 HTML，页面数值格式化不影响保存精度。
 
 pyapriltags 默认使用原始灰度图、`tag36h11`、`quad_decimate=1.0`、`refine_edges=1`，不预先去畸变或估计 Tag 位姿。角点固定按 `[1,0,3,2]` 重排，x、y 各减 0.5 px；OpenCV APRILTAG 沿用原编号，同样各减 0.5 px；NONE/SUBPIX/CONTOUR 不额外平移。转换只在 Detector 中执行一次，先于共同质量检查。
 当前 pyapriltags 版本实测 `refine_edges` 在默认设置下会影响角点；该版本绑定将默认 `decode_sharpening=0.25` 截断为实际 `0`，保留此行为并记录实际参数及版本。
-本项目使用 tag36h11 标定板。在 DB2632441 相同 17 张图的已有对比中，pyapriltags 的训练 RMSE 为 0.391959 px，低于 OpenCV SUBPIX 的 2.175249 px 和 CONTOUR 的 0.986527 px；当前配置据此选择 pyapriltags。此结果没有独立验证，不能仅因板子使用 AprilTag 就推断所有数据下均更优。
+ChArUco 使用 OpenCV 原生棋盘角点 ID 和像素坐标，不套用 AprilTag 的排列与半像素修正；检测时不输入待求内参。
+在 DB2632441 四标签板相同 17 张图的已有对比中，pyapriltags 的训练 RMSE 为 0.391959 px，低于 OpenCV SUBPIX 的 2.175249 px 和 CONTOUR 的 0.986527 px；当前四标签板配置据此选择 pyapriltags。此结果没有独立验证，不能仅因板子使用 AprilTag 就推断所有数据下均更优。
 
 ## Part 4：工程结构
 
@@ -179,7 +198,9 @@ Intrinsic/
 ├── configs/              # 采集流程、标定板及按序列号区分的相机配置
 ├── intrinsic/            # 命令行、设备取流、检测与标定
 │   ├── cli.py            # 命令入口、导入及检测器对照实验调度
-│   ├── board.py          # 标定板几何、两种检测前端与统一质量检查
+│   ├── board.py          # 两种板几何、角点 ID 对应及检测前端
+│   ├── quality.py        # 逐标签尺寸和清晰度 warning
+│   ├── capture.py        # 实时预览、候选帧复核及保留/排除
 │   ├── session.py        # 原始会话及不落盘的只读实验视图
 │   ├── solver.py         # 内参求解、独立验证和统计计算
 │   ├── report.py         # 数据与预览导出、报告生成调度

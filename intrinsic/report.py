@@ -85,7 +85,8 @@ def anomaly_summary(views):
     ranked = sorted(views, key=lambda v: (-v["rms_px"], v["id"]))[:3]
     worst_view = max(views, key=lambda v: v["metrics"]["max_error_px"])
     corner = int(np.argmax(np.linalg.norm(worst_view["residuals"], axis=1)))
-    return ranked, {"id": worst_view["id"], "corner": corner,
+    corner_id = worst_view.get("point_ids", range(len(worst_view["points"])))[corner]
+    return ranked, {"id": worst_view["id"], "corner": corner_id,
                     "point": worst_view["points"][corner],
                     "error_px": worst_view["metrics"]["max_error_px"]}
 
@@ -147,7 +148,8 @@ def export_report(session: Session, result: dict, output: Path) -> None:
         writer = csv.writer(handle)
         writer.writerow(["id", "role", "corner", "u_px", "v_px", "du_px", "dv_px", "error_px"])
         for v in views:
-            for i, (p, delta) in enumerate(zip(v["points"], v["residuals"])):
+            ids = v.get("point_ids", range(len(v["points"])))
+            for i, p, delta in zip(ids, v["points"], v["residuals"]):
                 writer.writerow([v["id"], v["role"], i, *p, *delta, float(np.linalg.norm(delta))])
     images_dir = output / "previews"
     images_dir.mkdir(exist_ok=True)

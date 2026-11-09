@@ -1,0 +1,7 @@
+{
+  "type": "charuco",
+  "dictionary": "DICT_5X5_100",
+  "squares": [12, 9],
+  "square_length_m": 0.03,
+  "marker_length_m": 0.0225
+}

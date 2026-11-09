@@ -37,16 +37,19 @@ def add_result_metrics(result: dict) -> None:
         group["image_count"] = len(views)
 
 
-def view_constraints(object_points: np.ndarray, observations: list[np.ndarray], size: tuple[int, int]) -> dict:
+def view_constraints(object_points: np.ndarray, observations: list[np.ndarray], size: tuple[int, int],
+                     object_subsets=None) -> dict:
     # Zhang's v12 and (v11-v22), with image and object coordinates normalized
     # to avoid the pixel/meter scale dominating the singular values.
     xy = object_points[:, :2].astype(float)
-    xy = (xy - xy.mean(axis=0)) / np.max(np.ptp(xy, axis=0))
+    center, scale = xy.mean(axis=0), np.max(np.ptp(xy, axis=0))
+    subsets = [object_points] * len(observations) if object_subsets is None else object_subsets
     def v(a, b):
         return np.array([a[0]*b[0], a[0]*b[1]+a[1]*b[0], a[1]*b[1],
                          a[2]*b[0]+a[0]*b[2], a[2]*b[1]+a[1]*b[2], a[2]*b[2]])
     constraints = []
-    for points in observations:
+    for objects, points in zip(subsets, observations):
+        xy = (objects[:, :2].astype(float) - center) / scale
         pixels = (points - np.asarray(size) / 2) / max(size)
         h, _ = cv2.findHomography(xy, pixels, 0)
         if h is None or not np.isfinite(h).all():
@@ -98,7 +101,7 @@ def model_diagnostics(K: np.ndarray, D: np.ndarray, size: tuple[int, int]) -> li
     return warnings
 
 
-def residual_record(row: dict, points: np.ndarray, K, D, rvec, tvec, object_points) -> dict:
+def residual_record(row: dict, points: np.ndarray, K, D, rvec, tvec, object_points, point_ids=None) -> dict:
     rotation, _ = cv2.Rodrigues(rvec)
     if np.any((object_points @ rotation.T + np.asarray(tvec).reshape(1, 3))[:, 2] <= 0):
         raise ValueError(f"Board behind camera: {row['id']}")
@@ -108,6 +111,7 @@ def residual_record(row: dict, points: np.ndarray, K, D, rvec, tvec, object_poin
     return {"id": row["id"], "image": row["image"], "role": row["role"],
             "rms_px": float(np.sqrt(np.mean(errors**2))), "max_error_px": float(errors.max()),
             "points": points.tolist(), "residuals": residuals.tolist(),
+            "point_ids": list(range(len(points))) if point_ids is None else point_ids,
             "metrics": residual_metrics(residuals),
             "rvec": np.asarray(rvec).ravel().tolist(), "tvec_m": np.asarray(tvec).ravel().tolist()}
 
@@ -123,16 +127,17 @@ def calibrate(session: Session, exclude: list[str] | None = None) -> dict:
         raise ValueError(f"Need at least {session.config['calibration']['min_views']} calibration images; got {len(rows)}")
     for row in rows:
         session.checked_image(row)
-    objects = Board.from_config(session.config).points
-    observations = [np.asarray(r["observation"]["corners"], np.float32) for r in rows]
+    board = Board.from_config(session.config)
+    pairs = [board.correspondences(r["observation"]) for r in rows]
+    objects, observations = map(list, zip(*pairs))
     size = tuple(session.manifest["image_size"])
-    diagnostics = view_constraints(objects, observations, size)
+    diagnostics = view_constraints(board.points, observations, size, objects)
     rms, K, D, rotations, translations, std_k, _, _ = cv2.calibrateCameraExtended(
-        [objects.copy() for _ in rows], observations, size, None, None,
+        objects, observations, size, None, None,
         flags=0, criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 100, 1e-10))
     warnings = diagnostics.pop("warnings") + model_diagnostics(K, D, size)
-    views = [residual_record(r, p, K, D, rv, tv, objects)
-             for r, p, rv, tv in zip(rows, observations, rotations, translations)]
+    views = [residual_record(r, p, K, D, rv, tv, obj, board.point_ids(r["observation"]["ids"]))
+             for r, p, rv, tv, obj in zip(rows, observations, rotations, translations, objects)]
     threshold = session.config["calibration"]["review_rms_px"]
     mark_reviews(views, threshold)
     review = [v["id"] for v in views if v["rms_px"] > threshold]
@@ -166,25 +171,28 @@ def validate(session: Session, result: dict) -> dict:
     rows = [r for r in session.records if r["role"] == "validation"]
     if not rows:
         raise ValueError("No held-out validation images; capture with V or import --role validation")
-    objects = Board.from_config(session.config).points
+    board = Board.from_config(session.config)
     views = []
     for row in rows:
         session.checked_image(row)
-        pixels = np.asarray(row["observation"]["corners"], np.float32)
+        objects, pixels = board.correspondences(row["observation"])
+        point_ids = board.point_ids(row["observation"]["ids"])
         ok, rotations, translations, _ = cv2.solvePnPGeneric(objects, pixels, K, D, flags=cv2.SOLVEPNP_IPPE)
         candidates = []
         if ok:
             for rv, tv in zip(rotations, translations):
                 if np.all((objects @ cv2.Rodrigues(rv)[0].T + tv.reshape(1, 3))[:, 2] > 0):
-                    candidates.append(residual_record(row, pixels, K, D, rv, tv, objects))
+                    candidates.append(residual_record(row, pixels, K, D, rv, tv, objects, point_ids))
         if not candidates:
             raise ValueError(f"Cannot estimate positive-depth validation pose: {row['id']}")
         best = min(candidates, key=lambda x: x["rms_px"])
         rv, tv = cv2.solvePnPRefineLM(objects, pixels, K, D, np.array(best["rvec"]), np.array(best["tvec_m"]))
-        refined = residual_record(row, pixels, K, D, rv, tv, objects)
+        refined = residual_record(row, pixels, K, D, rv, tv, objects, point_ids)
         views.append(refined if refined["rms_px"] <= best["rms_px"] else best)
     mark_reviews(views, session.config["calibration"]["review_rms_px"])
-    return {"created_utc": utc_now(), "rms_px": float(np.sqrt(np.mean([v["rms_px"]**2 for v in views]))),
+    rms = float(np.sqrt(sum(v["rms_px"]**2 * len(v["points"]) for v in views) /
+                        sum(len(v["points"]) for v in views)))
+    return {"created_utc": utc_now(), "rms_px": rms,
             "max_error_px": max(v["max_error_px"] for v in views), "views": views,
             "metrics": view_metrics(views), "image_count": len(views),
             "warnings": ["Fewer than five held-out views"] if len(views) < 5 else [],

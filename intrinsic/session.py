@@ -12,7 +12,8 @@ import cv2
 import numpy as np
 
 from . import __version__
-from .board import Observation, validate_config
+from .board import Board, Observation, validate_config
+from .config import detector_settings
 
 
 def utc_now() -> str:
@@ -121,6 +122,9 @@ class Session:
     @classmethod
     def create(cls, root: str | Path, config: dict, camera: dict, image_size: tuple[int, int]) -> "Session":
         validate_config(config)
+        config = copy.deepcopy(config)
+        if "detector" in config:
+            config["detector"] = detector_settings(config)
         if not camera.get("serial") or len(image_size) != 2 or min(image_size) <= 0:
             raise ValueError("Camera serial/identity and positive image dimensions are required")
         safe_serial = re.sub(r"[^A-Za-z0-9_.-]", "_", str(camera["serial"]))[:80].strip(".") or "camera"
@@ -149,9 +153,10 @@ class Session:
         if row.get("image") != f"images/{row['id']}.png":
             raise ValueError("Invalid frame image path")
         observation = row["observation"]
-        points = np.asarray(observation["corners"], float)
-        if not observation["valid"] or observation["ids"] != self.config["board"]["ids"] or points.shape != (16, 2):
-            raise ValueError(f"Invalid ordered observation: {row['id']}")
+        try:
+            _, points = Board.from_config(self.config).correspondences(observation)
+        except ValueError as error:
+            raise ValueError(f"Invalid ordered observation: {row['id']}: {error}") from error
         if not np.isfinite(points).all() or np.any(points < 0) or np.any(points >= self.manifest["image_size"]):
             raise ValueError(f"Out-of-bounds corners: {row['id']}")
 
@@ -182,6 +187,25 @@ class Session:
         write_json(self.path / "frames" / f"{frame_id}.json", row)
         self._records.append(row)
         return row
+
+    def save_excluded(self, image: np.ndarray, observation: Observation, role: str, reason: str,
+                      metadata: dict | None = None) -> Path:
+        """Retain a reviewed-out candidate without adding a training/validation record."""
+        if self.readonly:
+            raise ValueError("Experiment session views are read-only")
+        if list(image.shape[1::-1]) != self.manifest["image_size"] or image.dtype != np.uint8:
+            raise ValueError("Excluded image resolution/type differs from session")
+        frame_id = "f" + uuid.uuid4().hex[:12]
+        row = {"id": frame_id, "role": role, "image": f"images/{frame_id}.png", "saved_utc": utc_now(),
+               "observation": observation.to_dict(), "metadata": copy.deepcopy(metadata or {}),
+               "decision": "exclude", "reason": reason}
+        self._check_record(row)
+        folder = self.path / "exclude" / frame_id
+        folder.mkdir(parents=True, exist_ok=False)
+        row["image"] = "image.png"
+        write_image(folder / "image.png", image)
+        write_json(folder / "frame.json", row)
+        return folder
 
     def checked_image(self, row: dict) -> np.ndarray:
         if self.readonly:

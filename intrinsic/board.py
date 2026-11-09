@@ -9,10 +9,12 @@ import numpy as np
 
 
 from .config import DEFAULT_CONFIG, load_config, validate_config, detector_settings
+from .quality import assess, quality_config
 
 
 @dataclass(frozen=True)
 class Board:
+    kind = "four_apriltag"
     size: float = .07
     tag_size: float = .02
     gap: float = .01
@@ -36,6 +38,16 @@ class Board:
     @classmethod
     def from_config(cls, config: dict) -> "Board":
         b = config["board"]
+        if not isinstance(b, dict):
+            raise ValueError("Board configuration must be an object")
+        kind = b.get("type", "four_apriltag")
+        if kind == "charuco":
+            if set(b) != {"type", "dictionary", "squares", "square_length_m", "marker_length_m"}:
+                raise ValueError("Missing/unknown ChArUco board fields")
+            return CharucoBoard(b["squares"], b["dictionary"], b["square_length_m"], b["marker_length_m"])
+        required = {"family", "board_size_m", "tag_size_m", "gap_m", "ids", "rotations_deg"}
+        if kind != "four_apriltag" or set(b) - required - {"type"} or required - set(b):
+            raise ValueError("Missing/unknown four-AprilTag board fields")
         if b["family"] != "tag36h11":
             raise ValueError("Only tag36h11 is supported")
         try:
@@ -55,6 +67,17 @@ class Board:
             points.append(np.column_stack((local @ rotation.T + center, np.zeros(4))))
         return np.asarray(points, np.float32).reshape(-1, 3)
 
+    def point_ids(self, ids):
+        if any(type(i) is not int or i not in self.ids for i in ids) or len(set(ids)) != len(ids):
+            raise ValueError("Invalid board tag IDs")
+        return [4 * self.ids.index(tag_id) + corner for tag_id in ids for corner in range(4)]
+
+    def correspondences(self, observation):
+        obs = observation.to_dict() if isinstance(observation, Observation) else observation
+        if obs["ids"] != list(self.ids):
+            raise ValueError("Four ordered board tags must be visible")
+        return _paired_points(self, obs)
+
     def render(self, pixels: int = 1400) -> np.ndarray:
         """Reference image (not a substitute for checking physical print dimensions)."""
         image = np.full((pixels, pixels), 255, np.uint8)
@@ -68,13 +91,62 @@ class Board:
         return image
 
 
+class CharucoBoard:
+    kind = "charuco"
+
+    def __init__(self, squares, dictionary, square_length, marker_length):
+        if not isinstance(squares, (list, tuple)) or len(squares) != 2 or any(type(i) is not int or i < 3 for i in squares):
+            raise ValueError("ChArUco requires at least 3 x 3 squares")
+        dimensions = (square_length, marker_length)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in dimensions) or not np.isfinite(dimensions).all():
+            raise ValueError("ChArUco dimensions must be finite numeric")
+        if not 0 < marker_length < square_length:
+            raise ValueError("Require 0 < marker length < square length")
+        dictionary_id = getattr(cv2.aruco, dictionary, None) if isinstance(dictionary, str) and dictionary.startswith("DICT_") else None
+        if type(dictionary_id) is not int:
+            raise ValueError(f"Unknown OpenCV ChArUco dictionary: {dictionary}")
+        native_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        if squares[0] * squares[1] // 2 > len(native_dictionary.bytesList):
+            raise ValueError("ChArUco board requires more markers than its dictionary contains")
+        self.squares, self.dictionary = tuple(squares), dictionary
+        self.native = cv2.aruco.CharucoBoard(tuple(squares), square_length, marker_length, native_dictionary)
+        self.native.setLegacyPattern(False)
+        self.points = self.native.getChessboardCorners().astype(np.float32)
+
+    def point_ids(self, ids):
+        if any(type(i) is not int or not 0 <= i < len(self.points) for i in ids) or len(set(ids)) != len(ids):
+            raise ValueError("Invalid/duplicate ChArUco corner IDs")
+        return list(ids)
+
+    def correspondences(self, observation):
+        obs = observation.to_dict() if isinstance(observation, Observation) else observation
+        if len(obs["ids"]) < 6:
+            raise ValueError("At least six ChArUco corners are required")
+        return _paired_points(self, obs)
+
+    def render(self, pixels=1400):
+        x, y = self.squares
+        return self.native.generateImage((pixels, round(pixels * y / x)), marginSize=0, borderBits=1)
+
+
+def _paired_points(board, observation):
+    ids = board.point_ids(observation["ids"])
+    pixels = np.asarray(observation["corners"], np.float32)
+    if not observation["valid"] or pixels.shape != (len(ids), 2) or not np.isfinite(pixels).all():
+        raise ValueError("Invalid ordered observation")
+    objects = board.points[ids]
+    if np.linalg.matrix_rank(objects[:, :2] - objects[:, :2].mean(axis=0)) < 2:
+        raise ValueError("Board points are collinear")
+    return objects, pixels
+
+
 @dataclass
 class Observation:
     ids: list[int]
     corners: np.ndarray
     valid: bool
     issues: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[str | dict] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -85,11 +157,16 @@ class Observation:
 class Detector:
     def __init__(self, config: dict, backend: str | None = None, parameters: dict | None = None):
         self.board = Board.from_config(config)
-        self.quality = config["quality"]
-        self.family = config["board"]["family"]
+        self.quality = quality_config(config["quality"])
         settings = detector_settings(config, backend, parameters)
         self.backend = backend = settings["backend"]
-        if backend == "opencv":
+        if backend == "opencv_charuco":
+            self.detector = cv2.aruco.CharucoDetector(self.board.native)
+            self.description = {"backend": backend, "version": cv2.__version__,
+                                "dictionary": self.board.dictionary, "legacy_pattern": False,
+                                "pixel_offset_xy": [0, 0], "uses_camera_intrinsics": False}
+        elif backend == "opencv":
+            self.family = config["board"]["family"]
             params = cv2.aruco.DetectorParameters()
             method = settings[backend]["corner_refinement"]
             params.cornerRefinementMethod = getattr(cv2.aruco, "CORNER_REFINE_" + method)
@@ -101,6 +178,7 @@ class Detector:
                                 "window_size": params.cornerRefinementWinSize, "corner_permutation": [0, 1, 2, 3],
                                 "pixel_offset_xy": [-.5, -.5] if method == "APRILTAG" else [0, 0]}
         elif backend == "pyapriltags":
+            self.family = config["board"]["family"]
             try:
                 from pyapriltags import Detector as AprilTagDetector
             except ImportError as error:
@@ -117,25 +195,59 @@ class Detector:
         else:
             raise ValueError(f"Unknown detector backend: {backend}")
 
-    def detect(self, image: np.ndarray) -> Observation:
+    def detect(self, image: np.ndarray, *, check_quality=True) -> Observation:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         if gray.dtype != np.uint8:
             raise ValueError("Detection requires 8-bit gray/BGR images")
-        corners, ids = self._detect_opencv(gray) if self.backend == "opencv" else self._detect_pyapriltags(gray)
-        return self.assemble(gray, corners, ids)
+        if self.backend == "opencv_charuco":
+            return self._detect_charuco(gray, check_quality)
+        corners, ids, regions = self._detect_opencv(gray) if self.backend == "opencv" else self._detect_pyapriltags(gray)
+        return self.assemble(gray, corners, ids, check_quality=check_quality, regions=regions)
 
     def _detect_opencv(self, gray):
         corners, ids, _ = self.detector.detectMarkers(gray)
+        ids = [] if ids is None else ids.flatten().tolist()
+        regions = list(zip(ids, corners))
         if self.detector.getDetectorParameters().cornerRefinementMethod == cv2.aruco.CORNER_REFINE_APRILTAG:
             corners = [np.asarray(corner) - .5 for corner in corners]
-        return corners, [] if ids is None else ids.flatten().tolist()
+        return corners, ids, regions
 
     def _detect_pyapriltags(self, gray):
         detections = self.detector.detect(np.ascontiguousarray(gray), estimate_tag_pose=False)
         # Fixed decoded order and pixel-origin conversion, before shared checks.
-        return [tag.corners[[1, 0, 3, 2]] - .5 for tag in detections], [int(tag.tag_id) for tag in detections]
+        return ([tag.corners[[1, 0, 3, 2]] - .5 for tag in detections],
+                [int(tag.tag_id) for tag in detections], [(int(tag.tag_id), tag.corners) for tag in detections])
 
-    def assemble(self, gray: np.ndarray, corners, ids: list[int]) -> Observation:
+    def _detect_charuco(self, gray, check_quality):
+        corners, found, markers, marker_ids = self.detector.detectBoard(gray)
+        ids = [] if found is None else found.ravel().tolist()
+        points = np.empty((0, 2), np.float32) if corners is None else corners.reshape(-1, 2)
+        order = np.argsort(ids)
+        observation = Observation([ids[i] for i in order], points[order], True)
+        try:
+            self.board.correspondences(observation)
+        except ValueError as error:
+            observation.issues.append(str(error))
+        self._check_bounds(gray, observation)
+        observation.valid = not observation.issues
+        if check_quality and observation.valid:
+            regions = [] if marker_ids is None else list(zip(marker_ids.ravel(), markers))
+            self._assess(gray, observation, regions)
+        return observation
+
+    @staticmethod
+    def _check_bounds(gray, observation):
+        points = observation.corners
+        height, width = gray.shape
+        if len(points) and (not np.isfinite(points).all() or np.any(points < 1) or np.any(points >= [width - 1, height - 1])):
+            observation.issues.append("invalid/border-clipped corners")
+
+    def _assess(self, gray, observation, regions):
+        quality = assess(gray, regions, self.quality)
+        observation.metrics = {"tags": quality["metrics"], "thresholds": quality["thresholds"]}
+        observation.warnings = quality["warnings"]
+
+    def assemble(self, gray: np.ndarray, corners, ids: list[int], *, check_quality=True, regions=None) -> Observation:
         selected = [(int(i), np.asarray(c).reshape(4, 2)) for i, c in zip(ids, corners) if i in self.board.ids]
         issues, warnings = [], []
         if len(set(i for i, _ in selected)) != len(selected):
@@ -145,25 +257,10 @@ class Detector:
             issues.append(f"missing tags: {sorted(missing)}")
         selected.sort(key=lambda pair: self.board.ids.index(pair[0]))
         points = np.asarray([c for _, c in selected], np.float32).reshape(-1, 2)
-        metrics = {}
-        if len(points):
-            height, width = gray.shape
-            if not np.isfinite(points).all() or np.any(points < 1) or np.any(points >= [width - 1, height - 1]):
-                issues.append("invalid/border-clipped corners")
-            else:
-                quads = points.reshape(-1, 4, 2)
-                edge = np.linalg.norm(quads - np.roll(quads, -1, axis=1), axis=2).min()
-                mask = np.zeros_like(gray)
-                cv2.fillConvexPoly(mask, cv2.convexHull(points).astype(np.int32), 255)
-                roi = gray[mask > 0]
-                lap = cv2.Laplacian(gray, cv2.CV_32F)[mask > 0]
-                metrics = {"min_edge_px": float(edge), "blur_variance": float(lap.var()),
-                           "saturation_fraction": float(np.mean(roi >= 254)),
-                           "area_fraction": float(cv2.contourArea(cv2.convexHull(points)) / (width * height))}
-                if edge < self.quality["tag_edge_min_px"]:
-                    warnings.append("tags too small; move closer")
-                if metrics["blur_variance"] < self.quality["blur_variance_min"]:
-                    warnings.append("possible blur; hold board still and check focus")
-                if metrics["saturation_fraction"] > self.quality["saturation_fraction_max"]:
-                    warnings.append("possible clipping; inspect exposure (white board may also trigger this)")
-        return Observation([i for i, _ in selected], points, not issues, issues, warnings, metrics)
+        observation = Observation([i for i, _ in selected], points, not issues, issues, warnings)
+        self._check_bounds(gray, observation)
+        observation.valid = not observation.issues
+        if check_quality and observation.valid:
+            regions = selected if regions is None else [(i, p) for i, p in regions if i in self.board.ids]
+            self._assess(gray, observation, regions)
+        return observation

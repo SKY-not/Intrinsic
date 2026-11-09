@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import copy
 from contextlib import contextmanager
 
 import cv2
@@ -11,6 +12,44 @@ from .board import Detector
 from .camera import HikCamera, LatestFrame, Runtime
 from .session import Session
 from .config import resolve_camera_config
+from .quality import warning_text
+
+
+DELETE_KEYS = (3014656, 65535, 127)
+
+
+class CaptureReview:
+    """Own one frozen candidate until the user explicitly keeps or excludes it."""
+
+    def __init__(self, session):
+        self.session, self.pending = session, None
+
+    def stage(self, frame, observation, role, metadata):
+        if self.pending is not None:
+            raise ValueError("Resolve the current candidate before capturing another frame")
+        if not observation.valid:
+            raise ValueError("; ".join(observation.issues))
+        self.pending = {"image": frame.image.copy(), "observation": copy.deepcopy(observation),
+                        "role": role, "metadata": copy.deepcopy(metadata), "number": frame.number}
+        for warning in observation.warnings:
+            print("WARNING: " + warning_text(warning), flush=True)
+        print("检测通过；Enter 保留，Delete 排除，Q / Esc 退出。", flush=True)
+
+    def resolve(self, keep, reason):
+        if self.pending is None:
+            return None
+        p = self.pending
+        if keep:
+            row = self.session.save(p["image"], p["observation"], p["role"],
+                                    {**p["metadata"], "decision": "keep", "reason": reason})
+            print(f"已保留 {row['id']} ({row['role']})", flush=True)
+            result = row
+        else:
+            result = self.session.save_excluded(p["image"], p["observation"], p["role"], reason, p["metadata"])
+            print(f"已排除：{result}", flush=True)
+        # A failed write leaves the candidate available for retry.
+        self.pending = None
+        return result
 
 
 @contextmanager
@@ -39,7 +78,7 @@ def similar_view(points: np.ndarray, previous: list[np.ndarray], size) -> bool:
     return any(np.sqrt(np.mean(np.sum((points - old)**2, axis=1))) / scale < .02 for old in previous)
 
 
-def preview(image, observation, records, width, metadata=None):
+def preview(image, observation, records, width, metadata=None, *, kind="four_apriltag", review_role=None):
     display = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if image.ndim == 2 else image.copy()
     h, w = image.shape[:2]
     cells = set()
@@ -51,17 +90,23 @@ def preview(image, observation, records, width, metadata=None):
         cv2.rectangle(tint, (int(x*w/4), int(y*h/3)), (int((x+1)*w/4), int((y+1)*h/3)), (60, 120, 30), -1)
     cv2.addWeighted(tint, .15, display, .85, 0, display)
     if observation.ids:
-        cv2.aruco.drawDetectedMarkers(display,
-            [p.reshape(1, 4, 2) for p in observation.corners.reshape(-1, 4, 2)],
-            np.asarray(observation.ids, np.int32).reshape(-1, 1))
+        ids = np.asarray(observation.ids, np.int32).reshape(-1, 1)
+        if kind == "charuco":
+            cv2.aruco.drawDetectedCornersCharuco(display, observation.corners.reshape(-1, 1, 2), ids)
+        else:
+            cv2.aruco.drawDetectedMarkers(display,
+                [p.reshape(1, 4, 2) for p in observation.corners.reshape(-1, 4, 2)], ids)
     scale = min(1, width / w)
     display = cv2.resize(display, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     count = sum(r["role"] == "calibration" for r in records)
-    lines = [f"Space: calibration  V: validation  Q: quit | train={count}/30 val={len(records)-count}/5+",
-             f"Tags: {observation.ids} | {'READY' if observation.valid else 'INCOMPLETE'} | coverage {len(cells)}/12"]
+    status = f"REVIEW {review_role}: Enter keep | Delete exclude | Q/Esc exit" if review_role else "LIVE: Space calibration | V validation | Q/Esc exit"
+    detected = f"ChArUco corners: {len(observation.ids)}" if kind == "charuco" else f"Tags: {observation.ids}"
+    lines = [status, f"{detected} | {'READY' if observation.valid else 'INCOMPLETE'} | train={count}/30 val={len(records)-count}/5+ | coverage {len(cells)}/12"]
     if metadata and "gain_db" in metadata:
         lines.append(f"Exposure {metadata['exposure_us']:.0f} us | Gain {metadata['gain_db']:.2f} dB | Auto gain: {metadata['gain_auto']}")
-    lines += observation.issues + observation.warnings
+    lines += observation.issues + [warning_text(w, display=True) for w in observation.warnings[:6]]
+    if len(observation.warnings) > 6:
+        lines.append(f"+ {len(observation.warnings)-6} warnings; see terminal for all details")
     canvas = cv2.copyMakeBorder(display, 0, 28 * len(lines) + 12, 0, 0, cv2.BORDER_CONSTANT, value=(25, 25, 25))
     for i, line in enumerate(lines):
         cv2.putText(canvas, line, (10, display.shape[0] + 25 + i*28), cv2.FONT_HERSHEY_SIMPLEX, .52,
@@ -72,13 +117,13 @@ def preview(image, observation, records, width, metadata=None):
 def capture(config, root, serial=None, *, config_path=None, profile_path=None, camera_overrides=None,
             detector_backend=None):
     detector = Detector(config, backend=detector_backend)
-    window = "HIK Intrinsic - AprilTag"
+    window = "HIK Intrinsic - " + ("ChArUco" if detector.board.kind == "charuco" else "AprilTag")
     session = None
-    previous = []
-    saved_numbers = set()
+    review = None
+    reviewed_numbers = set()
     displayed = observation = None
     last_detection = 0.0
-    print("采集前固定镜头对焦和光圈。Space 保存标定图，V 保存独立验证图，Q 退出。")
+    print("采集前固定镜头对焦和光圈。Space 标定候选，V 验证候选；Enter 保留，Delete 排除，Q / Esc 退出。")
     print("请移动到画面中央、四边和四角，并绕横向、纵向倾斜；每次停稳后保存。")
     try:
         with configured_camera(config, serial, config_path, profile_path, camera_overrides) as (camera, config), LatestFrame(camera) as stream:
@@ -86,42 +131,55 @@ def capture(config, root, serial=None, *, config_path=None, profile_path=None, c
             while True:
                 frame = stream.latest()
                 now = time.monotonic()
-                if frame is not None and (displayed is None or frame.number != displayed.number) and now - last_detection >= 1/config["capture"]["detection_hz"]:
+                if (review is None or review.pending is None) and frame is not None and (displayed is None or frame.number != displayed.number) and now - last_detection >= 1/config["capture"]["detection_hz"]:
                     displayed = frame
-                    observation = detector.detect(frame.image)
-                    if observation.valid and similar_view(observation.corners, previous, frame.image.shape[1::-1]):
-                        observation.warnings.append("similar saved view; change position/tilt")
+                    observation = detector.detect(frame.image, check_quality=False)
                     last_detection = now
                     first_preview = session is None
                     if first_preview:
                         session = Session.create(root, config, camera.metadata, frame.image.shape[1::-1])
+                        review = CaptureReview(session)
                         print(f"会话：{session.path}")
-                    canvas = preview(frame.image, observation, session.records, config["capture"]["preview_width"], frame.metadata)
+                    canvas = preview(frame.image, observation, session.records, config["capture"]["preview_width"], frame.metadata, kind=detector.board.kind)
                     cv2.imshow(window, canvas)
                     if first_preview:
                         cv2.resizeWindow(window, canvas.shape[1], canvas.shape[0])
-                key = cv2.waitKey(15) & 0xff
+                key = cv2.waitKeyEx(15)
                 if key in (ord("q"), ord("Q"), 27) or (displayed is not None and cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1):
                     break
+                if review is not None and review.pending is not None:
+                    if key in (10, 13) or key in DELETE_KEYS:
+                        try:
+                            review.resolve(key in (10, 13), "user_confirmed" if key in (10, 13) else "user_deleted")
+                        except (ValueError, OSError, cv2.error) as error:
+                            print(f"保存失败，候选图仍待确认：{error}")
+                            continue
+                        canvas = preview(displayed.image, observation, session.records, config["capture"]["preview_width"], displayed.metadata, kind=detector.board.kind)
+                        cv2.imshow(window, canvas)
+                    continue
                 if key not in (32, ord("v"), ord("V")) or displayed is None:
                     continue
-                if displayed.number in saved_numbers:
-                    print("该帧已保存；请移动标定板并等待新图像。")
-                    continue
-                if not observation.valid:
-                    print("不能保存：" + "; ".join(observation.issues))
+                if displayed.number in reviewed_numbers:
+                    print("该帧已提交复核；请移动标定板并等待新图像。")
                     continue
                 try:
-                    row = session.save(displayed.image, observation,
-                                       "calibration" if key == 32 else "validation",
-                                       {**displayed.metadata, "detector": detector.description})
-                    saved_numbers.add(displayed.number)
-                    previous.append(observation.corners.copy())
-                    print(f"已保存 {row['id']} ({row['role']})" + ("；" + "; ".join(observation.warnings) if observation.warnings else ""))
-                except (ValueError, OSError) as error:
-                    print(f"保存失败：{error}")
+                    observation = detector.detect(displayed.image)
+                    role = "calibration" if key == 32 else "validation"
+                    review.stage(displayed, observation, role, {**displayed.metadata, "detector": detector.description})
+                except (ValueError, OSError, cv2.error) as error:
+                    print(f"不能提交候选图：{error}")
+                    continue
+                reviewed_numbers.add(displayed.number)
+                p = review.pending
+                canvas = preview(p["image"], p["observation"], session.records, config["capture"]["preview_width"],
+                                 p["metadata"], kind=detector.board.kind, review_role=role)
+                cv2.imshow(window, canvas)
     finally:
-        cv2.destroyAllWindows()
-        if session is not None:
-            print(f"数据保存在 {session.path}；接下来运行 calibrate --session。")
+        try:
+            if review is not None and review.pending is not None:
+                review.resolve(False, "exit_without_confirmation")
+        finally:
+            cv2.destroyAllWindows()
+            if session is not None:
+                print(f"数据保存在 {session.path}；接下来运行 calibrate --session。")
     return session
