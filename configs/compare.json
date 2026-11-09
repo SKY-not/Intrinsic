@@ -1,0 +1,7 @@
+[
+  {"name": "opencv_none", "backend": "opencv", "parameters": {"corner_refinement": "NONE", "window_size": 5}},
+  {"name": "opencv_subpix", "backend": "opencv", "parameters": {"corner_refinement": "SUBPIX", "window_size": 5}},
+  {"name": "opencv_contour", "backend": "opencv", "parameters": {"corner_refinement": "CONTOUR", "window_size": 5}},
+  {"name": "opencv_apriltag", "backend": "opencv", "parameters": {"corner_refinement": "APRILTAG", "window_size": 5}},
+  {"name": "pyapriltags", "backend": "pyapriltags", "parameters": {"quad_decimate": 1.0, "refine_edges": 1}}
+]

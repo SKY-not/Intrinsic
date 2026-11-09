@@ -1,0 +1,8 @@
+{
+  "board_file": "boards/apriltag_20mm.json",
+  "camera_dir": "cameras",
+  "capture": {"detection_hz": 5, "preview_width": 1280},
+  "quality": {"blur_variance_min": 40, "tag_edge_min_px": 30, "saturation_fraction_max": 0.4},
+  "calibration": {"min_views": 15, "review_rms_px": 1.0},
+  "detector": {"backend": "pyapriltags"}
+}

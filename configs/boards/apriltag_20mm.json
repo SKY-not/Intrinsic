@@ -1,0 +1,8 @@
+{
+  "family": "tag36h11",
+  "board_size_m": 0.07,
+  "tag_size_m": 0.02,
+  "gap_m": 0.01,
+  "ids": [1, 2, 3, 4],
+  "rotations_deg": [180, 180, 180, 180]
+}
